@@ -17,11 +17,69 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.manifold import TSNE # not actually using this; initially used it in notebooks to plot out simulated data by clusters
 
 import cvxpy as cp
+from joblib import Parallel, delayed
 
 from pandas.api.types import is_string_dtype
 from tqdm import tqdm
 
 from scipy.interpolate import interp1d, PchipInterpolator
+
+
+def get_mde(power_df, target_power=0.8, smooth=True, n_points=300):
+    """
+    Compute the Minimum Detectable Effect (MDE) for both positive and negative sides
+    using interpolation of the power curve.
+
+    Parameters
+    ----------
+    power_df : pd.DataFrame
+        Must contain columns ['effect', 'reject'] where 'reject' = mean power.
+    target_power : float, optional
+        Desired power threshold (default 0.8).
+    smooth : bool, optional
+        If True, apply smooth interpolation (PCHIP). Otherwise use raw grid.
+    n_points : int, optional
+        Number of interpolation grid points (default 300).
+
+    Returns
+    -------
+    mde_pos : float or np.nan
+        Minimum positive detectable effect size achieving target power.
+    mde_neg : float or np.nan
+        Minimum negative detectable effect size achieving target power.
+    """
+    power_curve = (
+        power_df.groupby('effect', as_index=False)['reject'].mean()
+        .sort_values('effect')
+        .reset_index(drop=True)
+    )
+
+    effects = power_curve['effect'].values
+    power_vals = power_curve['reject'].values
+
+    if smooth and len(effects) > 2:
+        f_interp = PchipInterpolator(effects, power_vals)
+        x_fine = np.linspace(min(effects), max(effects), n_points)
+        y_fine = np.clip(f_interp(x_fine), 0, 1)
+    else:
+        x_fine, y_fine = effects, power_vals
+
+    pos_mask = x_fine >= 0
+    neg_mask = x_fine <= 0
+
+    mde_pos = np.nan
+    mde_neg = np.nan
+
+    if np.any(y_fine[pos_mask] >= target_power):
+        idx_pos = np.argmax(y_fine[pos_mask] >= target_power)
+        mde_pos = x_fine[pos_mask][idx_pos]
+
+    if np.any(y_fine[neg_mask] >= target_power):
+        idx_neg = np.argmax(y_fine[neg_mask][::-1] >= target_power)
+        mde_neg = x_fine[neg_mask][::-1][idx_neg]
+
+    return mde_pos, mde_neg
+    
 
 def plot_power_comparison(
     power_forward: pd.DataFrame,
@@ -232,7 +290,6 @@ def simulate_experiment(Y,
     weekly_df['unit'] = weekly_df['unit'].astype('str')
 
     return weekly_df, [str(u) for u in treated_units], treatment_start_str
-
 
 
 
@@ -736,6 +793,7 @@ class FDID(BaseEstimator, RegressorMixin):
         self.did_controls = self._select_controls(self.X_pre.values, self.y_pre.values)
         self.alpha_U = np.mean(self.y_pre - np.mean(self.X_pre.loc[:, self.did_controls], axis=1))
         self.pre_r_squared = self._get_r_squared(np.mean(self.X_pre.loc[:, self.did_controls], axis=1), self.y_pre)
+        self.pre_rmse = self._get_rmse(np.mean(self.X_pre.loc[:, self.did_controls], axis=1), self.y_pre)
 
     def predict(self, inference: str = 'iid') -> None:
         """
@@ -792,6 +850,7 @@ class FDID(BaseEstimator, RegressorMixin):
             "interval_width (%)": [interval_width],
             "inference_method": [self.inference_method],
             "pre-treatment R2": [self.pre_r_squared],
+            "pre-treatment RMSE": [self.pre_rmse],
             "att": [self.att],
             "rel_att": [self.rel_att * 100.0],
             "se": [self.se],
@@ -833,6 +892,11 @@ class FDID(BaseEstimator, RegressorMixin):
     def _get_r_squared(self, x: np.ndarray, y: np.ndarray) -> np.float:
         yhat = np.mean(y - x) + x
         return 1 - np.sum((y - yhat) ** 2) / np.sum((y - np.mean(y)) ** 2)
+    
+    def _get_rmse(self, x: np.ndarray, y: np.ndarray) -> float:
+        yhat = np.mean(y - x) + x
+        rmse = np.sqrt(np.mean((y - yhat) ** 2))
+        return rmse        
 
     def _se_iid(self) -> np.float:
         T1 = len(self.pre_treatment)
@@ -1127,12 +1191,14 @@ class ForwardDesign:
         treatment_end_times = [times[i + n_treatment_times - 1] for i in treatment_start_idx]
         return treatment_start_times, treatment_end_times
 
+    
     def check_power(
         self,
         effect_sizes: list[float],
         vary_dates: bool = False,
         n_simulated_dates: int = 20,
         n_treatment_times: int = 4,
+        verbose: bool = True,
     ) -> pd.DataFrame:
         """
         Simulate experiments across multiple effect sizes and estimate power.
@@ -1166,7 +1232,7 @@ class ForwardDesign:
             treatment_end_times = [self.df[self.time_col].max()]
     
         # loop over effect sizes and treatment dates
-        for eff in tqdm(effect_sizes, desc="Simulating effect sizes"):
+        for eff in tqdm(effect_sizes, desc="Simulating effect sizes", disable=not verbose):
             for start, end in zip(treatment_start_times, treatment_end_times):
                 # Temporarily override treatment_start for this simulation
                 #self.treatment_start = start # this is the bug where I override the original self.treatment start
@@ -1185,6 +1251,8 @@ class ForwardDesign:
                     "lower": lower,
                     "upper": upper,
                     "reject": reject,
+                    "pre_r_squared": fdid.pre_r_squared,
+                    "pre_rmse": fdid.pre_rmse
                 })
     
         self.power_df = pd.DataFrame(dfs)
@@ -1215,7 +1283,6 @@ class ForwardDesign:
         effects = power_curve['effect'].values
         power_vals = power_curve['reject'].values
     
-        # Smooth interpolation (monotone cubic)
         if smooth and len(effects) > 2:
             f_interp = PchipInterpolator(effects, power_vals)
             x_fine = np.linspace(min(effects), max(effects), n_points)
@@ -1223,7 +1290,6 @@ class ForwardDesign:
         else:
             x_fine, y_fine = effects, power_vals
     
-        # --- Find positive and negative MDEs separately ---
         pos_mask = x_fine >= 0
         neg_mask = x_fine <= 0
     
@@ -1238,13 +1304,11 @@ class ForwardDesign:
             idx_neg = np.where(y_fine[neg_mask][::-1] >= target_power)[0][0]
             mde_neg = x_fine[neg_mask][::-1][idx_neg]
     
-        # --- Plot ---
         plt.figure(figsize=(7, 5))
         plt.plot(x_fine, y_fine, '-', lw=2, label='Interpolated', color='C0')
         #plt.scatter(effects, power_vals, color='C0', s=35, label='Simulated (raw)', alpha=0.7)
         plt.axhline(target_power, color='k', ls='--', label=f'{int(target_power*100)}% power')
     
-        # Annotate MDEs
         if not np.isnan(mde_pos):
             plt.axvline(mde_pos, color='r', ls=':', lw=2)
             plt.text(
@@ -1270,6 +1334,7 @@ class ForwardDesign:
         plt.tight_layout()
         plt.show()
 
+    
     def check_power_random(
         self,
         effect_sizes: list[float],
@@ -1278,80 +1343,91 @@ class ForwardDesign:
         n_reps: int = 10,
         treatment_start_times: list[pd.Timestamp] | None = None,
         n_treatment_times: int = 4,
+        n_jobs: int = -1,
+        verbose: bool = True,
     ):
         """
         Compare power for random treated/control configurations
-        using the same treatment windows as the forward design.
+        using the same treatment windows as the forward design
     
         Parameters
         ----------
         effect_sizes : list[float]
             List of treatment effects to simulate.
         n_treated : int, optional
-            Number of treated units to randomly sample (defaults to len(self.treated_pool)).
+            Number of treated units to randomly sample (defaults to len(self.treated_pool))
         n_controls : int, optional
-            Number of control units to randomly sample (defaults to len(self.control_pool)).
+            Number of control units to randomly sample (defaults to len(self.control_pool))
         n_reps : int
             Number of random draws per effect size.
         treatment_start_times : list[pd.Timestamp], optional
-            List of treatment start times (e.g., from self.sample_times()).
-            If None, uses [self.treatment_start].
+            List of treatment start times (e.g., from self.sample_times())
+            If None, uses [self.treatment_start]
         n_treatment_times : int
-            Length of treatment period in time units (e.g., days or weeks).
+            Length of treatment period in time units (e.g., days or weeks)
         """
         units = self.df[self.unit_col].unique()
         n_treated = n_treated or len(self.treated_pool)
         n_controls = n_controls or len(self.control_pool)
-        treatment_start_times = (
-            treatment_start_times or [pd.to_datetime(self.treatment_start)]
+        treatment_start_times = treatment_start_times or [pd.to_datetime(self.treatment_start)]
+        
+        df_base = self.df.copy()
+        df_base[self.time_col] = pd.to_datetime(df_base[self.time_col]).dt.to_period("W").dt.start_time
+    
+        def simulate_once(eff, t_start, rep):
+            t_end = t_start + pd.to_timedelta(n_treatment_times, unit="W")
+    
+            treated_rand = np.random.choice(units, n_treated, replace=False)
+            remaining = np.setdiff1d(units, treated_rand)
+            control_rand = np.random.choice(remaining, n_controls, replace=False)
+    
+            df_sim = df_base[df_base[self.time_col] <= t_end].copy()
+            mask = (
+                df_sim[self.unit_col].isin(treated_rand)
+                & (df_sim[self.time_col] >= t_start)
+                & (df_sim[self.time_col] < t_end)
+            )
+    
+            df_sim.loc[mask, self.metric_col] *= (1 + eff)
+            df_sim[self.time_col] = df_sim[self.time_col].dt.strftime("%Y-%m-%d")
+    
+            fdid = FDID(
+                df=df_sim,
+                unit_col=self.unit_col,
+                time_col=self.time_col,
+                metric_col=self.metric_col,
+                treated_units=list(treated_rand),
+                control_units=list(control_rand),
+                treatment_start=t_start.strftime("%Y-%m-%d"),
+            )
+            fdid.estimate(inference="iid")
+            summ = fdid.summary()
+    
+            lower, upper = summ["lower"].iloc[0], summ["upper"].iloc[0]
+            reject = int((lower > 0) | (upper < 0))  # two-sided
+    
+            return {
+                "design": "random",
+                "treatment_start": t_start,
+                "treatment_end": t_end,
+                "effect": eff,
+                "estimate": summ["rel_att"].iloc[0],
+                "lower": lower,
+                "upper": upper,
+                "reject": reject,
+                "pre_r_squared": fdid.pre_r_squared,
+                "pre_rmse": fdid.pre_rmse,
+            }
+    
+        tasks = [
+            delayed(simulate_once)(eff, t_start, rep)
+            for eff in effect_sizes
+            for t_start in treatment_start_times
+            for rep in range(n_reps)
+        ]
+    
+        results = Parallel(n_jobs=n_jobs, prefer="processes")(
+            tqdm(tasks, desc="Random design simulations", disable=not verbose)
         )
     
-        dfs = []
-        for eff in tqdm(effect_sizes, desc="Random design simulations"):
-            for t_start in treatment_start_times:
-                t_end = t_start + pd.to_timedelta(n_treatment_times, unit="W")
-    
-                for _ in range(n_reps):
-                    treated_rand = np.random.choice(units, n_treated, replace=False)
-                    remaining = np.setdiff1d(units, treated_rand)
-                    control_rand = np.random.choice(remaining, n_controls, replace=False)
-    
-                    df_sim = self.df.copy()
-                    df_sim[self.time_col] = pd.to_datetime(df_sim[self.time_col]).dt.to_period("W").apply(lambda r: r.start_time)
-                    mask = (
-                        df_sim[self.unit_col].isin(treated_rand)
-                        & (df_sim[self.time_col] >= t_start)
-                        & (df_sim[self.time_col] < t_end)
-                    )
-                    df_sim = df_sim.query(f"{self.time_col} <= @t_end").copy()
-                    df_sim[self.time_col] = df_sim[self.time_col].dt.strftime("%Y-%m-%d")
-                    df_sim.loc[mask, self.metric_col] *= (1 + eff)
-    
-                    fdid = FDID(
-                        df=df_sim,
-                        unit_col=self.unit_col,
-                        time_col=self.time_col,
-                        metric_col=self.metric_col,
-                        treated_units=list(treated_rand),
-                        control_units=list(control_rand),
-                        treatment_start=t_start.strftime("%Y-%m-%d"),
-                    )
-                    fdid.estimate(inference="iid")
-                    summ = fdid.summary()
-    
-                    lower, upper = summ["lower"].iloc[0], summ["upper"].iloc[0]
-                    reject = int((lower > 0) | (upper < 0))  # two-sided
-    
-                    dfs.append({
-                        "design": "random",
-                        "treatment_start": t_start,
-                        "treatment_end": t_end,
-                        "effect": eff,
-                        "estimate": summ["rel_att"].iloc[0],
-                        "lower": lower,
-                        "upper": upper,
-                        "reject": reject,
-                        "pre_r_squared": fdid.pre_r_squared
-                    })
-    
-        return pd.DataFrame(dfs)
+        return pd.DataFrame(results)        
