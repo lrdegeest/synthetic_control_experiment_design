@@ -491,21 +491,6 @@ class IFE:
     def _estimate_tau(self, Y, D, mask, K):
         tau = 0.0
         for _ in range(self.max_iter):
-            Y_resid = Y - tau * D
-            Y_resid[~mask] = np.nan
-            Lambda_hat, F_hat, _ = self._low_rank_completion(Y_resid, mask, K)
-            Y_tilde = Y - Lambda_hat @ F_hat.T
-            numerator = np.nansum(D * Y_tilde)
-            denominator = np.nansum(D * D)
-            tau_new = numerator / denominator
-            if abs(tau_new - tau) < self.tol:
-                break
-            tau = tau_new
-        return tau, Lambda_hat, F_hat
-
-    def _estimate_tau(self, Y, D, mask, K):
-        tau = 0.0
-        for _ in range(self.max_iter):
             # estimate factors on observed cells only
             Y_resid = Y - tau * D
             Y_resid[~mask] = np.nan
