@@ -14,7 +14,6 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import adfuller
 
 from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.manifold import TSNE # not actually using this; initially used it in notebooks to plot out simulated data by clusters
 
 import cvxpy as cp
 from joblib import Parallel, delayed
@@ -23,6 +22,9 @@ from pandas.api.types import is_string_dtype
 from tqdm import tqdm
 
 from scipy.interpolate import interp1d, PchipInterpolator
+
+from sklearn.decomposition import PCA
+from scipy.spatial import ConvexHull
 
 
 def get_mde(power_df, target_power=0.8, smooth=True, n_points=300):
@@ -82,9 +84,8 @@ def get_mde(power_df, target_power=0.8, smooth=True, n_points=300):
     
 
 def plot_power_comparison(
-    power_forward: pd.DataFrame,
-    power_random: pd.DataFrame,
-    title: str = "Power Comparison: Forward vs Random Design",
+    *dfs_with_labels,
+    title: str = "Power Comparison",
     figsize: tuple = (7, 5),
     ylabel: str = "Power",
     xlabel: str = "Effect Size (%)",
@@ -92,11 +93,34 @@ def plot_power_comparison(
     subtitle: str = None,
     return_summary: bool = False,
 ):
-    power_forward = power_forward.copy()
-    power_random = power_random.copy()
-    power_forward["design"] = "forward"
-    power_random["design"] = "random"
-    power_all = pd.concat([power_forward, power_random], ignore_index=True)
+    """
+    Plot power curves for an arbitrary number of designs.
+
+    Parameters
+    ----------
+    *dfs_with_labels : tuple
+        Any number of (label, DataFrame) pairs. Each DataFrame must contain
+        'effect' and 'reject' columns
+        Example: ('forward', power_forward), ('random', power_random)
+    title : str
+        Main title of the plot
+    figsize : tuple
+        Figure size.
+    ylabel, xlabel : str
+        Axis labels.
+    target_power : float
+        Draw a horizontal line at this power level.
+    subtitle : str, optional
+        Subtitle shown above the plot.
+    return_summary : bool
+        If True, returns a summary DataFrame with mean power by effect and design.
+    """
+    all_dfs = []
+    for label, df in dfs_with_labels:
+        df_copy = df.copy()
+        df_copy["design"] = label
+        all_dfs.append(df_copy)
+    power_all = pd.concat(all_dfs, ignore_index=True)
 
     power_summary = (
         power_all.groupby(["design", "effect"], as_index=False)
@@ -108,7 +132,7 @@ def plot_power_comparison(
         plt.plot(
             df_design["effect"] * 100,
             df_design["power"],
-            label=f"{design_name.title()} Design",
+            label=design_name.title(),
             lw=2
         )
 
@@ -116,7 +140,7 @@ def plot_power_comparison(
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.title(title, fontsize=14)
-    if subtitle is not None:
+    if subtitle:
         plt.suptitle(subtitle, fontsize=10, y=0.95)
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -125,8 +149,7 @@ def plot_power_comparison(
 
     if return_summary:
         return power_summary
-    else:
-        pass
+
 
 
 
@@ -147,9 +170,11 @@ def infer_time_freq(times: np.ndarray) -> str:
 
 def simulate_factor_model(
     N=100, T=400, G=5, K=3, convex=True,
-    between_cluster_scale=1.0, within_cluster_scale=5.0,
-    factor_noise_scale=5.0, idiosyncratic_noise_scale=5.0,
+    between_cluster_scale=1.0, within_cluster_scale=1.0,
+    factor_noise_scale=5.0, idiosyncratic_noise_scale=1.0,
     base_level=100, cluster_random_effect_scale=10.0,
+    distribution='normal',
+    cluster_center='normal',
     phi_factors=0.8, seed=None
 ):
     """
@@ -182,14 +207,31 @@ def simulate_factor_model(
     cluster_size = N // G
     unit_cluster = np.repeat(np.arange(1, G + 1), cluster_size)
 
-    cluster_centers = np.random.normal(0, between_cluster_scale, size=(G, K))
+    if cluster_center == 'normal':
+        cluster_centers = np.random.normal(0, between_cluster_scale, size=(G, K))
+    elif cluster_center == 'dirichlet': 
+        cluster_centers = np.random.dirichlet([1] * K, size=G) * between_cluster_scale
+    
     Lambda = np.zeros((K, N))
+        
+    # choose an epsilon
     for i in range(N):
         g = unit_cluster[i] - 1
-        Lambda[:, i] = cluster_centers[g] + np.random.normal(0, within_cluster_scale, size=K)
+        if distribution == "normal":
+            noise = np.random.normal(0, within_cluster_scale, K)
+        elif distribution == "lognormal":
+            noise = np.random.lognormal(0, within_cluster_scale, K)
+        elif distribution == "uniform":
+            noise = np.random.uniform(-within_cluster_scale, within_cluster_scale, K)
+        elif distribution == "gamma":
+            noise = np.random.gamma(shape=2.0, scale=within_cluster_scale, size=K) - 2.0 * within_cluster_scale
+        else:
+            raise ValueError(f"Unsupported distribution {distribution}")
+        Lambda[:, i] = cluster_centers[g] + noise        
 
     if convex:
         # normalize Lambda to be convex weights (so we have a convex factor model)
+        # forces each unit's loadings to sum to one and keeps Y on the same scale across units
         Lambda = Lambda / Lambda.sum(axis=0, keepdims=True)
 
     # AR(1) factor process 
@@ -207,6 +249,65 @@ def simulate_factor_model(
     Y = base_level + Ybar + E + unit_baselines[np.newaxis, :]
 
     return Y, Ybar, Lambda, F, unit_cluster, cluster_baselines    
+
+
+def plot_factor_clusters(Lambda, unit_cluster, three_dim=False, figsize=(9, 6)):
+      
+    if three_dim:
+        
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection='3d')
+        clusters = np.unique(unit_cluster)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(clusters)))
+
+        for i, cluster_id in enumerate(clusters):
+            mask = (unit_cluster == cluster_id)
+            ax.scatter(Lambda[0, mask], Lambda[1, mask], Lambda[2, mask],
+                       color=colors[i], label=f'Cluster {cluster_id}', alpha=0.7)
+        
+            ax.set_xlabel('λ₁')
+            ax.set_ylabel('λ₂')
+            ax.set_zlabel('λ₃')
+        plt.legend()
+        plt.show()
+        
+    else:
+        
+        X = Lambda.T
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(X)
+        hull = ConvexHull(X_pca)
+    
+        plt.figure(figsize=figsize)
+        clusters = np.unique(unit_cluster)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(clusters)))
+    
+        for i, cluster_id in enumerate(clusters):
+            cluster_mask = (unit_cluster == cluster_id)
+            plt.scatter(
+                X_pca[cluster_mask, 0],
+                X_pca[cluster_mask, 1],
+                color=colors[i],
+                label=f'Cluster {cluster_id}',
+                alpha=0.7
+            )
+    
+        for simplex in hull.simplices:
+            plt.plot(X_pca[simplex, 0], X_pca[simplex, 1],
+                     color='gray', linestyle='--', lw=2, alpha=0.8)
+    
+        plt.plot(
+            X_pca[hull.vertices[[-1, 0]], 0],
+            X_pca[hull.vertices[[-1, 0]], 1],
+            color='gray', linestyle='--', lw=2, alpha=0.8
+        )
+    
+        plt.xlabel("Principal Component 1", fontsize=12)
+        plt.ylabel("Principal Component 2", fontsize=12)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.show()
+
 
 
 def simulate_experiment(Y, 
@@ -426,6 +527,7 @@ class Synth:
 #=======================================
 # interactive fixed effects estimator
 # attempt to replicate the Xu et al (2017) method
+# estimates Yit =Λi Ft +τ Dit +εit,
 # need to add inference methods
 # mostly just used this to sanity check factor simulator 
 #=======================================
@@ -491,12 +593,27 @@ class IFE:
     def _estimate_tau(self, Y, D, mask, K):
         tau = 0.0
         for _ in range(self.max_iter):
+            Y_resid = Y - tau * D
+            Y_resid[~mask] = np.nan
+            Lambda_hat, F_hat, _ = self._low_rank_completion(Y_resid, mask, K)
+            Y_tilde = Y - Lambda_hat @ F_hat.T
+            numerator = np.nansum(D * Y_tilde)
+            denominator = np.nansum(D * D)
+            tau_new = numerator / denominator
+            if abs(tau_new - tau) < self.tol:
+                break
+            tau = tau_new
+        return tau, Lambda_hat, F_hat
+
+    def _estimate_tau(self, Y, D, mask, K):
+        tau = 0.0
+        for _ in range(self.max_iter):
             # estimate factors on observed cells only
             Y_resid = Y - tau * D
             Y_resid[~mask] = np.nan
             Λ, F, _ = self._low_rank_completion(Y_resid, mask, K)
     
-            # now update τ using all cells (not masked)
+            # now update tau using all cells
             Y_tilde = Y - Λ @ F.T
             num = np.nansum(D * Y_tilde)
             den = np.nansum(D * D)
@@ -558,7 +675,7 @@ class IFE:
             if self.verbose:
                 print(f"CV disabled. Using first K in list: {K_use}")
 
-        # estimate τ and factors on control + pre data
+        # estimate tau and factors on control + pre data
         tau_hat, Lambda_ctrl, F_hat = self._estimate_tau(Y, D, mask, K_use)
 
         #project treated unit loadings using pre-period only
@@ -932,6 +1049,46 @@ class FDID(BaseEstimator, RegressorMixin):
         print(adf_table)
         print(test_info)
         print(ar_table)        
+        
+
+    def hte(self, verbose) -> None:
+        """
+        Estimate heterogeneous treatment effects by fitting separate FDID models
+        for each treated unit, excluding all other treated units from the control pool.
+        """
+        if not hasattr(self, 'results'):
+            raise ValueError("`estimate()` must be run before `hte()`")
+
+        summaries = []
+        pbar = tqdm(self.treated_units, desc="Estimating HTEs", disable=not verbose)
+        for treated_unit in pbar:
+            pbar.set_description(f"Estimating ATT for treated unit: {treated_unit}")
+
+            # exclude all treated units except the current one
+            df_filtered = self.df[
+                ~self.df[self.unit_col].isin(self.treated_units) | (self.df[self.unit_col] == treated_unit)
+            ]
+
+            # temporary estimator with the current treated unit
+            temp_estimator = self.__class__(
+                df=df_filtered,
+                metric_col=self.metric_col,
+                unit_col=self.unit_col,
+                time_col=self.time_col,
+                treated_units=[treated_unit],
+                treatment_start=self.treatment_start,
+            )
+
+            # run the estimation pipeline
+            temp_estimator.estimate()
+            summary_df = temp_estimator.summary()
+            summary_df['treated_unit'] = treated_unit
+            summaries.append(summary_df)
+
+        hte_results = pd.concat(summaries, ignore_index=True)
+        # move treated_unit col to the front
+        cols = ['treated_unit'] + [col for col in hte_results.columns if col != 'treated_unit']
+        self.hte_results = hte_results[cols]        
 
 
 
