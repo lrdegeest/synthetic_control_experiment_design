@@ -1,30 +1,23 @@
 from __future__ import annotations
 
+import cvxpy as cp
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy.stats
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.ticker import PercentFormatter
 import seaborn as sns
-
-import statsmodels.api as sm
+import scipy.stats
+from joblib import Parallel, delayed
+from pandas.api.types import is_string_dtype
+from scipy.interpolate import interp1d, PchipInterpolator
+from scipy.spatial import ConvexHull
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.decomposition import PCA
 from statsmodels.iolib.table import SimpleTable
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import adfuller
-
-from sklearn.base import BaseEstimator, RegressorMixin
-
-import cvxpy as cp
-from joblib import Parallel, delayed
-
-from pandas.api.types import is_string_dtype
+import statsmodels.api as sm
 from tqdm import tqdm
-
-from scipy.interpolate import interp1d, PchipInterpolator
-
-from sklearn.decomposition import PCA
-from scipy.spatial import ConvexHull
 
 
 def get_mde(power_df, target_power=0.8, smooth=True, n_points=300):
