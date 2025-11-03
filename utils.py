@@ -228,11 +228,14 @@ def simulate_factor_model(
         else:
             raise ValueError(f"Unsupported distribution {distribution}")
         Lambda[:, i] = cluster_centers[g] + noise        
+        #Lambda[:, i] = cluster_centers[g] * (1 + noise)
+
 
     if convex:
         # normalize Lambda to be convex weights (so we have a convex factor model)
         # forces each unit's loadings to sum to one and keeps Y on the same scale across units
         Lambda = Lambda / Lambda.sum(axis=0, keepdims=True)
+        # preserve within-cluster variation by multiplicative perturbation
 
     # AR(1) factor process 
     F = np.zeros((T, K))
@@ -254,7 +257,6 @@ def simulate_factor_model(
 def plot_factor_clusters(Lambda, unit_cluster, three_dim=False, figsize=(9, 6)):
       
     if three_dim:
-        
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection='3d')
         clusters = np.unique(unit_cluster)
@@ -264,13 +266,24 @@ def plot_factor_clusters(Lambda, unit_cluster, three_dim=False, figsize=(9, 6)):
             mask = (unit_cluster == cluster_id)
             ax.scatter(Lambda[0, mask], Lambda[1, mask], Lambda[2, mask],
                        color=colors[i], label=f'Cluster {cluster_id}', alpha=0.7)
-        
-            ax.set_xlabel('λ₁')
-            ax.set_ylabel('λ₂')
-            ax.set_zlabel('λ₃')
+
+        ax.grid(True)
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_zticklabels([])
+
+        ax.set_xlabel('λ₁')
+        ax.set_ylabel('λ₂')
+        ax.set_zlabel('λ₃')
+        ax.zaxis.labelpad=-15
+        ax.yaxis.labelpad=-15
+        ax.xaxis.labelpad=-15
+
+        ax.view_init(elev=20, azim=25)
+        plt.tight_layout()
         plt.legend()
-        plt.show()
-        
+        plt.show()  
+              
     else:
         
         X = Lambda.T
